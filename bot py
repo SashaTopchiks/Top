@@ -1,0 +1,335 @@
+import asyncio
+import io
+import os
+import sqlite3
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, BufferedInputFile
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не вказано BOT_TOKEN у змінних середовища!")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
+# --- Робота з базою даних ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER PRIMARY KEY,
+            expires_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            target_key TEXT PRIMARY KEY,
+            report_text TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def normalize_target(raw: str) -> str:
+    return raw.strip().lstrip("@").lower()
+
+
+def set_subscription(user_id: int, days: int) -> str:
+    now = datetime.utcnow()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT expires_at FROM subscriptions WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+
+    base_time = now
+    if row:
+        try:
+            current_exp = datetime.fromisoformat(row[0])
+            if current_exp > now:
+                base_time = current_exp
+        except ValueError:
+            pass
+
+    new_exp = base_time + timedelta(days=days)
+    cur.execute("""
+        INSERT INTO subscriptions (user_id, expires_at)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET expires_at = excluded.expires_at
+    """, (user_id, new_exp.isoformat()))
+    conn.commit()
+    conn.close()
+    return new_exp.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def remove_subscription(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_subscription_info(user_id: int) -> tuple[bool, str | None]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT expires_at FROM subscriptions WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return False, None
+
+    try:
+        exp = datetime.fromisoformat(row[0])
+        if exp > datetime.utcnow():
+            return True, exp.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        pass
+    return False, None
+
+
+def upsert_record(target: str, report_text: str) -> str:
+    key = normalize_target(target)
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO records (target_key, report_text, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(target_key) DO UPDATE SET
+            report_text = excluded.report_text,
+            updated_at = excluded.updated_at
+    """, (key, report_text.strip(), now_str))
+    conn.commit()
+    conn.close()
+    return key
+
+
+def delete_record(target: str) -> bool:
+    key = normalize_target(target)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM records WHERE target_key = ?", (key,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_record(target: str) -> tuple[str, str] | None:
+    key = normalize_target(target)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT report_text, updated_at FROM records WHERE target_key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return (row[0], row[1]) if row else None
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# --- Команди користувача ---
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    active, exp = get_subscription_info(message.from_user.id)
+    status = f"активна до <b>{exp}</b>" if active else "неактивна (потрібна підписка)"
+    text = (
+        "Вітаю! Надішліть запит (наприклад, <code>@username</code> або ID), щоб отримати звіт у <b>.txt</b>.\n\n"
+        f"Ваш статус підписки: {status}\n"
+        "Перевірити профіль: /profile"
+    )
+    if is_admin(message.from_user.id):
+        text += (
+            "\n\n<b>Адмін-панель:</b>\n"
+            "• <code>/addsub USER_ID ДНІ</code> — видати/продовжити підписку\n"
+            "• <code>/delsub USER_ID</code> — зняти підписку\n"
+            "• <code>/addrec @target | текст звіту</code> — додати або оновити звіт\n"
+            "• <code>/delrec @target</code> — видалити звіт\n"
+            "• <code>/stats</code> — статистика бази"
+        )
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("profile"))
+async def cmd_profile(message: Message):
+    active, exp = get_subscription_info(message.from_user.id)
+    if active:
+        await message.answer(
+            f"<b>Профіль</b>\nID: <code>{message.from_user.id}</code>\n"
+            f"Підписка: <b>Активна</b>\nДіє до: <b>{exp}</b>",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"<b>Профіль</b>\nID: <code>{message.from_user.id}</code>\n"
+            "Підписка: <b>Неактивна</b>\n\n"
+            "Безкоштовні запити недоступні. Зверніться до адміністратора для активації підписки.",
+            parse_mode="HTML",
+        )
+
+
+# --- Команди адміна ---
+@dp.message(Command("addsub"))
+async def cmd_addsub(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await message.answer("Формат: <code>/addsub 123456789 30</code>", parse_mode="HTML")
+        return
+
+    target_user_id = int(parts[1])
+    days = int(parts[2])
+    if days <= 0:
+        await message.answer("Кількість днів має бути більшою за 0.")
+        return
+
+    exp_str = set_subscription(target_user_id, days)
+    await message.answer(
+        f"Підписку видано користувачу <code>{target_user_id}</code> на <b>{days}</b> дн.\n"
+        f"Активна до: <b>{exp_str}</b>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("delsub"))
+async def cmd_delsub(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: <code>/delsub 123456789</code>", parse_mode="HTML")
+        return
+
+    target_user_id = int(parts[1])
+    if remove_subscription(target_user_id):
+        await message.answer(f"Підписку користувача <code>{target_user_id}</code> видалено.", parse_mode="HTML")
+    else:
+        await message.answer("Підписку для цього ID не знайдено.")
+
+
+@dp.message(Command("addrec"))
+async def cmd_addrec(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    raw_body = (message.text or "").partition(" ")[2]
+    if "|" not in raw_body:
+        await message.answer(
+            "Формат:\n<code>/addrec @username | Ім'я: Тест\nМісто: Київ\nПримітка: ...</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    target_part, report_part = raw_body.split("|", 1)
+    target_key = normalize_target(target_part)
+    if not target_key or not report_part.strip():
+        await message.answer("Вкажіть коректний запит і текст звіту після <code>|</code>.", parse_mode="HTML")
+        return
+
+    saved_key = upsert_record(target_key, report_part)
+    await message.answer(
+        f"Звіт збережено для ключа: <code>{saved_key}</code>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("delrec"))
+async def cmd_delrec(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer("Формат: <code>/delrec @username</code>", parse_mode="HTML")
+        return
+
+    if delete_record(parts[1]):
+        await message.answer(f"Запис <code>{normalize_target(parts[1])}</code> видалено.", parse_mode="HTML")
+    else:
+        await message.answer("Такого запису немає в базі.")
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM records")
+    rec_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM subscriptions")
+    sub_count = cur.fetchone()[0]
+    conn.close()
+    await message.answer(
+        f"<b>Статистика</b>\nЗвітів у базі: <b>{rec_count}</b>\nЗаписів підписок: <b>{sub_count}</b>",
+        parse_mode="HTML",
+    )
+
+
+# --- Пошук і видача .txt ---
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_lookup(message: Message):
+    user_id = message.from_user.id
+    active, exp = get_subscription_info(user_id)
+
+    if not active and not is_admin(user_id):
+        await message.answer(
+            "<b>Доступ обмежено</b>\n"
+            "Для пошуку потрібна активна підписка. Перевірте статус через /profile.",
+            parse_mode="HTML",
+        )
+        return
+
+    query_raw = (message.text or "").strip()
+    record = get_record(query_raw)
+
+    if not record:
+        await message.answer(f"За запитом <code>{query_raw}</code> даних не знайдено.", parse_mode="HTML")
+        return
+
+    report_text, updated_at = record
+    file_content = (
+        f"Запит: {query_raw}\n"
+        f"Оновлено: {updated_at}\n"
+        f"{'-' * 32}\n"
+        f"{report_text}\n"
+    ).encode("utf-8")
+
+    safe_name = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in normalize_target(query_raw)) or "report"
+    doc = BufferedInputFile(file_content, filename=f"{safe_name}.txt")
+
+    await message.answer_document(
+        document=doc,
+        caption=f"Звіт за запитом <code>{query_raw}</code> сформовано.",
+        parse_mode="HTML",
+    )
+
+
+async def main():
+    init_db()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
